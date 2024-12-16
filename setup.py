@@ -34,6 +34,7 @@ setup(
     keywords="DNA codon usage",
     packages=find_packages(exclude="docs"),
     include_package_data=True,
+    install_requires=["requests"],
     package_data={
         "python_codon_tables": ["../codon_usage_data/*", "../codon_usage_data/**/*"]
     },
