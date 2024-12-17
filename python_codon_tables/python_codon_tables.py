@@ -1,48 +1,32 @@
-import sys
-import re
 import os
 from functools import lru_cache
 
-if sys.version_info[0] == 3:
-    import urllib.request
+from .helpers import csv_string_to_codons_dict, table_with_U_replaced_by_T
+from .python_codon_tables_cocoputs import get_codons_table_cocoputs
+from .python_codon_tables_kazusa import download_codons_table_kazusa
 
-    urlopen = urllib.request.urlopen
-else:
-    import urllib2
 
-    urlopen = urllib2.urlopen
+KNOWN_CUTS_SOURCES = {"kazusa", "cocoputs"}
 
 _this_dir = os.path.dirname(os.path.realpath(__file__))
 _tables_dir = os.path.join(_this_dir, "..", "codon_usage_data", "tables")
 
-available_codon_tables_names = [filename[:-4] for filename in os.listdir(_tables_dir)]
+available_codon_tables_names = {
+    source: [filename[:-4] for filename in os.listdir(os.path.join(_tables_dir, source))]
+    for source in KNOWN_CUTS_SOURCES
+}
 
 available_codon_tables_shortnames = {
-    "_".join(table_name.split("_")[:-1]): table_name
-    for table_name in available_codon_tables_names
+    source: {
+        "_".join(table_name.split("_")[:-1]): table_name
+        for table_name in available_codon_tables_names[source]
+    }
+    for source in KNOWN_CUTS_SOURCES
 }
 
 
-def csv_string_to_codons_dict(csv_string):
-    """Transform a CSV string of a codon table to a dict."""
-    result = {}
-    for line in csv_string.split("\n")[1:]:
-        aa, codon, freq = line.split(",")
-        if aa not in result:
-            result[aa] = {}
-        result[aa][codon] = float(freq)
-    return result
-
-
-def table_with_U_replaced_by_T(table):
-    return {
-        aa: {codon.replace("U", "T"): freq for codon, freq in aa_data.items()}
-        for aa, aa_data in table.items()
-    }
-
-
 @lru_cache(maxsize=128)
-def get_codons_table(table_name, replace_U_by_T=True, web_timeout=5):
+def get_codons_table(table_name, replace_U_by_T=True, web_timeout=5, source="kazusa"):
     """Get data from one of this package's builtin codon usage tables.
 
     The ``table_name`` argument very flexible on purpose, it can be either an
@@ -54,74 +38,45 @@ def get_codons_table(table_name, replace_U_by_T=True, web_timeout=5):
 
     If a taxonomic ID is provided and no table with this taxID is present in
     the ``codon_usage_data/tables/`` folder, the table will be downloaded from
-    the http://www.kazusa.or.jp/codon website. As this website sometimes go
-    down, the parameter ``web_timeout`` controls how long to wait before a
-    Python exception is raised, informing the user that Kazusa may be down.
+    either the http://www.kazusa.or.jp/codon or CocoPUTS
+    (https://dnahive.fda.gov/dna.cgi?cmd=cuts_main) website. As these websites
+    sometimes go down, the parameter ``web_timeout`` controls how long to wait
+    before a Python exception is raised, informing the user that the service may
+    be down.
 
     The ``replace_U_by_T`` argument will replace all codons names from UAA to
     TAA etc.
+
+    The ``source`` argument can be used to specify the source of the codon tables.
+    Either "kazusa" or "cocoputs" are supported (defaults to "kazusa").
 
     Returns a dict {"*": {'TAA': 0.64...}, 'K': {'AAA': 0.76...}, ...}
 
     
     """
+    source = source.lower()
+    if source not in KNOWN_CUTS_SOURCES:
+        raise ValueError(f"Unknown source: {source}. Please select from {', '.join(KNOWN_CUTS_SOURCES)}")
+
     if replace_U_by_T:
-        table = get_codons_table(table_name, replace_U_by_T=False, web_timeout=5)
+        table = get_codons_table(table_name, replace_U_by_T=False, web_timeout=5, source=source)
         return table_with_U_replaced_by_T(table)
     if isinstance(table_name, int) or str.isdigit(table_name):
-        return download_codons_table(taxid=table_name, timeout=web_timeout)
-    if table_name in available_codon_tables_shortnames:
-        table_name = available_codon_tables_shortnames[table_name]
-    with open(os.path.join(_tables_dir, table_name + ".csv"), "r") as f:
-        return csv_string_to_codons_dict(f.read())
+        if source == "kazusa":
+            return download_codons_table_kazusa(taxid=table_name, timeout=web_timeout)
+        elif source == "cocoputs":
+            return get_codons_table_cocoputs(taxid=int(table_name))
+    elif table_name in available_codon_tables_shortnames[source]:
+        table_name = available_codon_tables_shortnames[source][table_name]
+        with open(os.path.join(_tables_dir, source, table_name + ".csv"), "r") as f:
+            return csv_string_to_codons_dict(f.read())
+    else:
+        raise ValueError(f"Unknown table_name: {table_name}")
 
 
-def get_all_available_codons_tables(replace_U_by_T=True):
+def get_all_available_codons_tables(replace_U_by_T=True, source="kazusa"):
     """Get all data from all of this package's builtin codon usage tables."""
     return {
-        table_name: get_codons_table(table_name, replace_U_by_T=replace_U_by_T)
+        table_name: get_codons_table(table_name, replace_U_by_T=replace_U_by_T, source=source)
         for table_name in available_codon_tables_names
     }
-
-
-@lru_cache(maxsize=128)
-def download_codons_table(taxid=316407, target_file=None, timeout=5):
-    """Get all data from all of this package's builtin codon usage tables."""
-    _kazusa_url = (
-        "http://www.kazusa.or.jp/codon/cgi-bin/showcodon.cgi" "?aa=1&style=N&species=%s"
-    )
-    _codon_regexpr = r"([ATGCU]{3}) ([A-Z]|\*) (\d.\d+)"
-    url = _kazusa_url % taxid
-    try:
-        web_handle = urlopen(url, timeout=timeout)
-    except Exception as err:
-        if "timed out" in str(err):
-            raise RuntimeError(
-                (
-                    "connexion to %s timed out after %d seconds. Maybe "
-                    "their website is down?"
-                )
-                % (url, timeout)
-            )
-        else:
-            raise err
-
-    html_content = web_handle.read().decode().replace("\n", " ")
-    if "<title>not found</title>" in html_content.lower():
-        raise RuntimeError(
-            "Codon usage table for taxonomy ID '%s' not found:" " %s" % (taxid, url)
-        )
-    csv_data = "\n".join(
-        ["amino_acid,codon,relative_frequency"]
-        + sorted(
-            [
-                "%s,%s,%s" % (aa, codon, usage)
-                for codon, aa, usage in re.findall(_codon_regexpr, html_content)
-            ]
-        )
-    )
-    if target_file is not None:
-        with open(target_file, "w+") as f:
-            f.write(csv_data)
-    else:
-        return csv_string_to_codons_dict(csv_data)
